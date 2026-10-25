@@ -2136,7 +2136,9 @@ static void CL_PredictRemotePlayer(int playernum, player_state_t *state, int mse
 	struct predicted_player *player = &predicted_players[playernum];
 	player_state_t previous, next, exact;
 	vec3_t offset = {0}, error;
-	qbool smoothing = cl_predict_lerp.value != 0 && playernum != cl.playernum;
+	// While paused, positions are frozen but each update still looks newer,
+	// so replaying the previous state would add movement that never happened.
+	qbool smoothing = cl_predict_lerp.value != 0 && playernum != cl.playernum && !cl.paused;
 	qbool exponential = cl_predict_lerp.integer == 2;
 	qbool compare = false;
 
