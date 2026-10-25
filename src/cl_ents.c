@@ -42,11 +42,15 @@ void TP_ParsePlayerInfo(player_state_t *, player_state_t *, player_info_t *info)
 #endif
 
 extern cvar_t cl_predict_players, cl_solid_players, cl_rocket2grenade;
-extern cvar_t cl_predict_half;
+extern cvar_t cl_predict_half, cl_predict_lerp;
 extern cvar_t cl_model_bobbing;		
 extern cvar_t cl_nolerp, cl_lerp_monsters, cl_newlerp;
 extern cvar_t r_drawvweps;		
 extern  unsigned int     cl_dlight_active[MAX_DLIGHTS/32];       
+
+#define CL_PREDICT_LERP_TIME 0.04f // seconds
+#define CL_PREDICT_LERP_SNAP_DISTANCE 120.0f
+#define CL_PREDICT_LERP_STOP_EPSILON 0.01f
 
 static struct predicted_player {
 	int flags;
@@ -63,6 +67,13 @@ static struct predicted_player {
 	vec3_t drawn_origin;
 	int msec;
 	float paused_sec;
+
+	// Compare server updates at the same prediction time, independently of rendering.
+	player_state_t prediction_state;
+	qbool prediction_valid;
+	vec3_t lerp_offset;
+	double lerp_start_time;
+	qbool lerping;
 } predicted_players[MAX_CLIENTS];
 
 char *cl_modelnames[cl_num_modelindices];
@@ -2106,6 +2117,137 @@ void CL_StorePausePredictionLocations(void)
 	}
 }
 
+// CL_PredictUsercmd halves long commands recursively, truncating odd milliseconds.
+static int CL_RemotePredictionMsec(int msec)
+{
+	int steps = 1;
+
+	while (msec > 50) {
+		msec /= 2;
+		steps *= 2;
+	}
+	return msec * steps;
+}
+
+// Called with this player's collision solids installed. Keep the ordinary prediction
+// separate from its visual correction so movement never feeds back into smoothing.
+static void CL_PredictRemotePlayer(int playernum, player_state_t *state, int msec, vec3_t origin)
+{
+	struct predicted_player *player = &predicted_players[playernum];
+	player_state_t previous, next, exact;
+	vec3_t offset = {0}, error;
+	qbool smoothing = cl_predict_lerp.value != 0 && playernum != cl.playernum;
+	qbool exponential = cl_predict_lerp.integer == 2;
+	qbool compare = false;
+
+	if (!smoothing || cl.time < player->lerp_start_time) {
+		player->lerping = false;
+	}
+	if (player->lerping) {
+		double elapsed = cl.time - player->lerp_start_time;
+		float decay = exponential ? exp(-elapsed / CL_PREDICT_LERP_TIME) : max(0.0f, 1.0f - elapsed / CL_PREDICT_LERP_TIME);
+
+		VectorScale(player->lerp_offset, decay, offset);
+		// Exponential decay has no finite endpoint; discard a negligible tail.
+		if (decay <= 0 || (exponential && VectorLength(offset) < CL_PREDICT_LERP_STOP_EPSILON)) {
+			VectorClear(offset);
+			player->lerping = false;
+		}
+	}
+
+	if (smoothing && player->prediction_valid && state->messagenum != player->prediction_state.messagenum) {
+		double target_time = state->state_time + CL_RemotePredictionMsec(msec) * 0.001;
+		double elapsed = (target_time - player->prediction_state.state_time) * 1000;
+
+		// Do not replay across time resets, stale states, respawns or model changes.
+		if (state->state_time >= player->prediction_state.state_time && elapsed >= 0 && elapsed <= 255 &&
+			state->pm_type == player->prediction_state.pm_type && state->modelindex == player->prediction_state.modelindex) {
+			int remaining = (int)(elapsed + 0.5);
+			usercmd_t command = player->prediction_state.command;
+
+			previous = player->prediction_state;
+			// Use the normal predictor's recursive split: different step sizes
+			// manufacture errors under friction, gravity and collisions.
+			if (remaining > 0) {
+				command.msec = remaining;
+				next = previous;
+				CL_PredictUsercmd(&previous, &next, &command, false);
+				previous = next;
+				remaining -= CL_RemotePredictionMsec(command.msec);
+			}
+			// Finish only the milliseconds truncated by that split, so the
+			// compared positions still represent the same time.
+			if (remaining > 0) {
+				command.msec = remaining;
+				next = previous;
+				CL_PredictUsercmd(&previous, &next, &command, false);
+				previous = next;
+			}
+			compare = true;
+		}
+		else {
+			player->lerping = false;
+			VectorClear(offset);
+		}
+	}
+
+	exact = *state;
+	if (msec > 0) {
+		state->command.msec = msec;
+		CL_PredictUsercmd(state, &exact, &state->command, false);
+	}
+	VectorCopy(exact.origin, origin);
+
+	if (compare) {
+		float distance;
+
+		VectorSubtract(previous.origin, exact.origin, error);
+		distance = VectorLength(error);
+		// Large discrepancies should snap instead of leaving a displaced model.
+		if (distance >= CL_PREDICT_LERP_SNAP_DISTANCE) {
+			player->lerping = false;
+			VectorClear(offset);
+		}
+		else if (distance > 0) {
+			// Decay the old correction before adding the new discrepancy to
+			// preserve continuity when another packet changes the prediction.
+			VectorAdd(offset, error, offset);
+			distance = VectorLength(offset);
+			if (distance >= CL_PREDICT_LERP_SNAP_DISTANCE) {
+				player->lerping = false;
+				VectorClear(offset);
+			}
+			else {
+				VectorCopy(offset, player->lerp_offset);
+				player->lerp_start_time = cl.time;
+				player->lerping = true;
+			}
+		}
+	}
+	VectorAdd(origin, offset, origin);
+	if (player->lerping) {
+		trace_t trace = PM_PlayerTrace(exact.origin, origin);
+
+		if (trace.startsolid || trace.allsolid) {
+			// The raw position is authoritative when a mover encloses the hull.
+			VectorCopy(exact.origin, origin);
+			VectorClear(player->lerp_offset);
+			player->lerping = false;
+		}
+		else if (trace.fraction < 1) {
+			VectorCopy(trace.endpos, origin);
+			// Trim the saved correction too, without restarting its decay.
+			// Otherwise the blocked part would return when the obstacle moves.
+			VectorScale(player->lerp_offset, trace.fraction, player->lerp_offset);
+			if (trace.fraction == 0) {
+				player->lerping = false;
+			}
+		}
+	}
+	player->prediction_state = *state;
+	player->prediction_valid = smoothing;
+}
+
 // Create visible entities in the correct position for all current players
 static void CL_LinkPlayers(void)
 {
@@ -2114,7 +2256,7 @@ static void CL_LinkPlayers(void)
 	vec3_t tmp, end, diff;
 	double playertime = CL_PlayerTime();
 	player_info_t *info;
-	player_state_t *state, exact;
+	player_state_t *state;
 	entity_t ent;
 	centity_t *cent;
 	frame_t *frame;
@@ -2128,11 +2270,18 @@ static void CL_LinkPlayers(void)
 
 	for (j = 0; j < MAX_CLIENTS; j++, info++, state++) 
 	{
+		qbool was_drawn = predicted_players[j].drawn;
+
 		info = &cl.players[j];
 		state = &frame->playerstate[j];
 		cent = &cl_entities[j + 1];
 
+		// Preserve last frame's validity for lerping while resetting this frame's visibility.
 		predicted_players[j].drawn = false;
+		if (!was_drawn) {
+			predicted_players[j].lerping = false;
+			predicted_players[j].prediction_valid = false;
+		}
 
 		if (state->messagenum != cl.parsecount)
 			continue;	// not present this frame
@@ -2281,23 +2430,23 @@ static void CL_LinkPlayers(void)
 
 		// only predict half the move to minimize overruns
 		msec = (cl_predict_half.value ? 500 : 1000) * (cl.paused ? predicted_players[j].paused_sec : (playertime - state->state_time));
-		if (msec <= 0 || !cl_predict_players.value || cls.mvdplayback) {
+		if (!cl_predict_players.value || cls.mvdplayback) {
 			VectorCopy (state->origin, ent.origin);
 			VectorCopy(ent.origin, predicted_players[j].drawn_origin);
 			predicted_players[j].msec = 0;
 			predicted_players[j].drawn = true;
+			predicted_players[j].lerping = false;
+			predicted_players[j].prediction_valid = false;
 		}
 		else {
-			// predict players movement
-			msec = min(msec, 255);
-			state->command.msec = msec;
-
+			// A late packet still needs correction smoothing, even when
+			// there is no movement left to extrapolate.
+			msec = bound(0, msec, 255);
 			oldphysent = pmove.numphysent;
 			CL_SetSolidPlayers(j);
-			CL_PredictUsercmd(state, &exact, &state->command, false);
+			CL_PredictRemotePlayer(j, state, msec, ent.origin);
 			pmove.numphysent = oldphysent;
-			VectorCopy(exact.origin, ent.origin);
-			VectorCopy(exact.origin, predicted_players[j].drawn_origin);
+			VectorCopy(ent.origin, predicted_players[j].drawn_origin);
 			predicted_players[j].msec = msec;
 			predicted_players[j].drawn = true;
 		}

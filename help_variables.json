@@ -2409,6 +2409,27 @@
       "group-id": "21",
       "type": "boolean"
     },
+    "cl_predict_lerp": {
+      "default": "1",
+      "desc": "Enables smoothing of prediction corrections for remote players.",
+      "group-id": "21",
+      "type": "integer",
+      "remarks": "Only affects other players, not your own movement.",
+      "values": [
+        {
+          "description": "Disabled",
+          "name": "0"
+        },
+        {
+          "description": "Linear decay (faster)",
+          "name": "1"
+        },
+        {
+          "description": "Exponential decay (smoother)",
+          "name": "2"
+        }
+      ]
+    },
     "cl_predict_players": {
       "default": "1",
       "desc": "This toggles the prediction for other players' movement. Unless you are having problems this variable should be left at \"1\".",
