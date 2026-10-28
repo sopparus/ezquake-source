@@ -51,6 +51,8 @@ extern  unsigned int     cl_dlight_active[MAX_DLIGHTS/32];
 #define CL_PREDICT_LERP_TIME 0.04f // seconds
 #define CL_PREDICT_LERP_SNAP_DISTANCE 120.0f
 #define CL_PREDICT_LERP_STOP_EPSILON 0.01f
+#define CL_PREDICT_LERP_MAX_MSEC 255 // oldest update worth replaying
+#define CL_PREDICT_LERP_PUSH_SPEED 150.0f // velocity change no input can make in one update
 
 static struct predicted_player {
 	int flags;
@@ -2117,8 +2119,9 @@ void CL_StorePausePredictionLocations(void)
 	}
 }
 
-// CL_PredictUsercmd halves long commands recursively, truncating odd milliseconds.
-static int CL_RemotePredictionMsec(int msec)
+// CL_PredictUsercmd halves moves over 50 ms and drops the odd milliseconds,
+// so this is how much time it actually simulates.
+static int CL_PredictedMsec(int msec)
 {
 	int steps = 1;
 
@@ -2129,65 +2132,125 @@ static int CL_RemotePredictionMsec(int msec)
 	return msec * steps;
 }
 
-// Called with this player's collision solids installed. Keep the ordinary prediction
-// separate from its visual correction so movement never feeds back into smoothing.
+// Predict exactly msec ahead, running the milliseconds CL_PredictUsercmd drops as a
+// second step. Splitting differently would itself shift the result under friction.
+static void CL_PredictExactMsec(player_state_t *from, player_state_t *to, usercmd_t command, int msec)
+{
+	player_state_t step;
+
+	*to = *from;
+	while (msec > 0) {
+		step = *to;
+		command.msec = msec;
+		CL_PredictUsercmd(&step, to, &command, false);
+		msec -= CL_PredictedMsec(msec);
+	}
+}
+
+// What is left of the last correction. It shrinks to nothing over CL_PREDICT_LERP_TIME.
+static void CL_DecayPredictionLerp(struct predicted_player *player, vec3_t offset)
+{
+	double elapsed = cl.time - player->lerp_start_time;
+	qbool exponential = cl_predict_lerp.integer == 2;
+	float decay;
+
+	VectorClear(offset);
+	if (!player->lerping || elapsed < 0) {
+		player->lerping = false;
+		return;
+	}
+	decay = exponential ? exp(-elapsed / CL_PREDICT_LERP_TIME) : 1.0f - elapsed / CL_PREDICT_LERP_TIME;
+	// Exponential decay has no endpoint; drop a negligible tail.
+	if (decay <= 0 || (exponential && decay * VectorLength(player->lerp_offset) < CL_PREDICT_LERP_STOP_EPSILON)) {
+		player->lerping = false;
+		return;
+	}
+	VectorScale(player->lerp_offset, decay, offset);
+}
+
+// Where the previous update would have put the player at the time the new update is
+// predicted to, and how fast. False when the two updates cannot be compared.
+static qbool CL_ReplayPreviousUpdate(struct predicted_player *player, player_state_t *state, int msec, vec3_t origin, vec3_t velocity)
+{
+	player_state_t *previous = &player->prediction_state;
+	player_state_t replayed;
+	double target_time = state->state_time + CL_PredictedMsec(msec) * 0.001;
+	double elapsed = (target_time - previous->state_time) * 1000;
+
+	// Not across time resets, stale states, respawns or model changes.
+	if (state->state_time < previous->state_time || elapsed > CL_PREDICT_LERP_MAX_MSEC ||
+		state->pm_type != previous->pm_type || state->modelindex != previous->modelindex) {
+		return false;
+	}
+	CL_PredictExactMsec(previous, &replayed, previous->command, (int)(elapsed + 0.5));
+	VectorCopy(replayed.origin, origin);
+	VectorCopy(replayed.velocity, velocity);
+	return true;
+}
+
+// Forget the last update, so the next one is drawn as is.
+static void CL_ResetPredictionLerp(int playernum)
+{
+	predicted_players[playernum].lerping = false;
+	predicted_players[playernum].prediction_valid = false;
+}
+
+// Knockback or a landing changed the velocity in a way the previous update could not
+// know about. When that moved the player the way it is going now, the jump is real
+// movement: showing it at once looks like the hit, easing it out looks like rubber.
+static qbool CL_PushedForward(player_state_t *state, vec3_t replayed_velocity, vec3_t offset)
+{
+	vec3_t change;
+
+	VectorSubtract(state->velocity, replayed_velocity, change);
+	if (VectorLength(change) <= CL_PREDICT_LERP_PUSH_SPEED) {
+		return false;
+	}
+	// Dropping the offset moves the model by -offset.
+	return offset[0] * state->velocity[0] + offset[1] * state->velocity[1] <= 0;
+}
+
+// Keep the correction from pushing the model into walls.
+static void CL_ClipPredictionLerp(struct predicted_player *player, vec3_t exact, vec3_t origin)
+{
+	trace_t trace = PM_PlayerTrace(exact, origin);
+
+	if (trace.startsolid || trace.allsolid) {
+		// The raw position is authoritative when a mover encloses the hull.
+		VectorCopy(exact, origin);
+		VectorClear(player->lerp_offset);
+		player->lerping = false;
+	}
+	else if (trace.fraction < 1) {
+		VectorCopy(trace.endpos, origin);
+		// Trim the saved correction without restarting its decay, so the
+		// blocked part does not come back when the obstacle moves.
+		VectorScale(player->lerp_offset, trace.fraction, player->lerp_offset);
+		player->lerping = trace.fraction > 0;
+	}
+}
+
+// Predict another player and, instead of jumping when a new update disagrees with the
+// last one, ease the difference out. Called with the player's collision solids installed.
 static void CL_PredictRemotePlayer(int playernum, player_state_t *state, int msec, vec3_t origin)
 {
 	struct predicted_player *player = &predicted_players[playernum];
-	player_state_t previous, next, exact;
-	vec3_t offset = {0}, error;
 	// While paused, positions are frozen but each update still looks newer,
 	// so replaying the previous state would add movement that never happened.
-	qbool smoothing = cl_predict_lerp.value != 0 && playernum != cl.playernum && !cl.paused;
-	qbool exponential = cl_predict_lerp.integer == 2;
+	qbool smoothing = cl_predict_lerp.integer && playernum != cl.playernum && !cl.paused;
 	qbool compare = false;
+	player_state_t exact;
+	vec3_t offset, replayed, replayed_velocity, error;
+	float distance;
 
-	if (!smoothing || cl.time < player->lerp_start_time) {
+	if (!smoothing) {
 		player->lerping = false;
 	}
-	if (player->lerping) {
-		double elapsed = cl.time - player->lerp_start_time;
-		float decay = exponential ? exp(-elapsed / CL_PREDICT_LERP_TIME) : max(0.0f, 1.0f - elapsed / CL_PREDICT_LERP_TIME);
-
-		VectorScale(player->lerp_offset, decay, offset);
-		// Exponential decay has no finite endpoint; discard a negligible tail.
-		if (decay <= 0 || (exponential && VectorLength(offset) < CL_PREDICT_LERP_STOP_EPSILON)) {
-			VectorClear(offset);
-			player->lerping = false;
-		}
-	}
+	CL_DecayPredictionLerp(player, offset);
 
 	if (smoothing && player->prediction_valid && state->messagenum != player->prediction_state.messagenum) {
-		double target_time = state->state_time + CL_RemotePredictionMsec(msec) * 0.001;
-		double elapsed = (target_time - player->prediction_state.state_time) * 1000;
-
-		// Do not replay across time resets, stale states, respawns or model changes.
-		if (state->state_time >= player->prediction_state.state_time && elapsed >= 0 && elapsed <= 255 &&
-			state->pm_type == player->prediction_state.pm_type && state->modelindex == player->prediction_state.modelindex) {
-			int remaining = (int)(elapsed + 0.5);
-			usercmd_t command = player->prediction_state.command;
-
-			previous = player->prediction_state;
-			// Use the normal predictor's recursive split: different step sizes
-			// manufacture errors under friction, gravity and collisions.
-			if (remaining > 0) {
-				command.msec = remaining;
-				next = previous;
-				CL_PredictUsercmd(&previous, &next, &command, false);
-				previous = next;
-				remaining -= CL_RemotePredictionMsec(command.msec);
-			}
-			// Finish only the milliseconds truncated by that split, so the
-			// compared positions still represent the same time.
-			if (remaining > 0) {
-				command.msec = remaining;
-				next = previous;
-				CL_PredictUsercmd(&previous, &next, &command, false);
-				previous = next;
-			}
-			compare = true;
-		}
-		else {
+		compare = CL_ReplayPreviousUpdate(player, state, msec, replayed, replayed_velocity);
+		if (!compare) {
 			player->lerping = false;
 			VectorClear(offset);
 		}
@@ -2198,26 +2261,18 @@ static void CL_PredictRemotePlayer(int playernum, player_state_t *state, int mse
 		state->command.msec = msec;
 		CL_PredictUsercmd(state, &exact, &state->command, false);
 	}
-	VectorCopy(exact.origin, origin);
 
 	if (compare) {
-		float distance;
-
-		VectorSubtract(previous.origin, exact.origin, error);
+		VectorSubtract(replayed, exact.origin, error);
 		distance = VectorLength(error);
-		// Large discrepancies should snap instead of leaving a displaced model.
-		if (distance >= CL_PREDICT_LERP_SNAP_DISTANCE) {
-			player->lerping = false;
-			VectorClear(offset);
-		}
-		else if (distance > 0) {
-			// Decay the old correction before adding the new discrepancy to
-			// preserve continuity when another packet changes the prediction.
+		if (distance > 0) {
+			// Add to what is left of the previous correction, so the model stays put.
 			VectorAdd(offset, error, offset);
-			distance = VectorLength(offset);
-			if (distance >= CL_PREDICT_LERP_SNAP_DISTANCE) {
-				player->lerping = false;
+			if (distance >= CL_PREDICT_LERP_SNAP_DISTANCE || VectorLength(offset) >= CL_PREDICT_LERP_SNAP_DISTANCE ||
+				CL_PushedForward(state, replayed_velocity, offset)) {
+				// Too far off to be a prediction error, or a real push: snap.
 				VectorClear(offset);
+				player->lerping = false;
 			}
 			else {
 				VectorCopy(offset, player->lerp_offset);
@@ -2226,25 +2281,10 @@ static void CL_PredictRemotePlayer(int playernum, player_state_t *state, int mse
 			}
 		}
 	}
-	VectorAdd(origin, offset, origin);
-	if (player->lerping) {
-		trace_t trace = PM_PlayerTrace(exact.origin, origin);
 
-		if (trace.startsolid || trace.allsolid) {
-			// The raw position is authoritative when a mover encloses the hull.
-			VectorCopy(exact.origin, origin);
-			VectorClear(player->lerp_offset);
-			player->lerping = false;
-		}
-		else if (trace.fraction < 1) {
-			VectorCopy(trace.endpos, origin);
-			// Trim the saved correction too, without restarting its decay.
-			// Otherwise the blocked part would return when the obstacle moves.
-			VectorScale(player->lerp_offset, trace.fraction, player->lerp_offset);
-			if (trace.fraction == 0) {
-				player->lerping = false;
-			}
-		}
+	VectorAdd(exact.origin, offset, origin);
+	if (player->lerping) {
+		CL_ClipPredictionLerp(player, exact.origin, origin);
 	}
 	player->prediction_state = *state;
 	player->prediction_valid = smoothing;
@@ -2281,8 +2321,7 @@ static void CL_LinkPlayers(void)
 		// Preserve last frame's validity for lerping while resetting this frame's visibility.
 		predicted_players[j].drawn = false;
 		if (!was_drawn) {
-			predicted_players[j].lerping = false;
-			predicted_players[j].prediction_valid = false;
+			CL_ResetPredictionLerp(j);
 		}
 
 		if (state->messagenum != cl.parsecount)
@@ -2437,8 +2476,7 @@ static void CL_LinkPlayers(void)
 			VectorCopy(ent.origin, predicted_players[j].drawn_origin);
 			predicted_players[j].msec = 0;
 			predicted_players[j].drawn = true;
-			predicted_players[j].lerping = false;
-			predicted_players[j].prediction_valid = false;
+			CL_ResetPredictionLerp(j);
 		}
 		else {
 			// A late packet still needs correction smoothing, even when
