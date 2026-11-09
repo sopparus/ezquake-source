@@ -498,7 +498,6 @@ extern  unsigned int     cl_dlight_active[MAX_DLIGHTS/32];
 
 #define CL_PREDICT_LERP_TIME 0.04f // seconds
 #define CL_PREDICT_LERP_SNAP_DISTANCE 120.0f
-#define CL_PREDICT_LERP_STOP_EPSILON 0.01f
 #define CL_PREDICT_LERP_MAX_MSEC 255 // oldest update worth replaying
 #define CL_PREDICT_LERP_PUSH_SPEED 150.0f // more than running or air control changes the velocity in one update
 
@@ -2703,7 +2702,6 @@ static void CL_PredictExactMsec(player_state_t *from, player_state_t *to, usercm
 static void CL_DecayPredictionLerp(struct predicted_player *player, vec3_t offset)
 {
 	double elapsed = cl.time - player->lerp_start_time;
-	qbool exponential = cl_predict_lerp.integer == 2;
 	float decay;
 
 	VectorClear(offset);
@@ -2711,9 +2709,8 @@ static void CL_DecayPredictionLerp(struct predicted_player *player, vec3_t offse
 		player->lerping = false;
 		return;
 	}
-	decay = exponential ? exp(-elapsed / CL_PREDICT_LERP_TIME) : 1.0f - elapsed / CL_PREDICT_LERP_TIME;
-	// Exponential decay has no endpoint; drop a negligible tail.
-	if (decay <= 0 || (exponential && decay * VectorLength(player->lerp_offset) < CL_PREDICT_LERP_STOP_EPSILON)) {
+	decay = 1.0f - elapsed / CL_PREDICT_LERP_TIME;
+	if (decay <= 0) {
 		player->lerping = false;
 		return;
 	}

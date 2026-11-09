@@ -2418,24 +2418,10 @@
     },
     "cl_predict_lerp": {
       "default": "1",
-      "desc": "Enables smoothing of prediction corrections for remote players.",
+      "desc": "Smooths prediction corrections of other players over 40 ms instead of drawing them at once.",
       "group-id": "21",
-      "type": "integer",
-      "remarks": "Only affects other players, not your own movement.",
-      "values": [
-        {
-          "description": "Disabled",
-          "name": "0"
-        },
-        {
-          "description": "Linear decay (faster)",
-          "name": "1"
-        },
-        {
-          "description": "Exponential decay (smoother)",
-          "name": "2"
-        }
-      ]
+      "type": "boolean",
+      "remarks": "Only affects other players, not your own movement."
     },
     "cl_predict_players": {
       "default": "1",
