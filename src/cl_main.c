@@ -174,6 +174,8 @@ cvar_t	cl_predict_players = {"cl_predict_players", "1"};
 cvar_t	cl_solid_players = {"cl_solid_players", "1"};
 cvar_t	cl_predict_half = {"cl_predict_half", "0"};
 cvar_t	cl_predict_selfpos = {"cl_predict_selfpos", "1"};
+cvar_t	cl_predict_interp = {"cl_predict_interp", "0"};
+cvar_t	cl_predict_interp_shift = {"cl_predict_interp_shift", "0"};
 cvar_t	cl_predict_lerp = {"cl_predict_lerp", "1"};
 
 cvar_t	hud_fps_min_reset_interval = {"hud_fps_min_reset_interval", "30"};
@@ -2106,6 +2108,8 @@ static void CL_InitLocal(void)
 	Cvar_Register(&cl_solid_players);
 	Cvar_Register(&cl_predict_half);
 	Cvar_Register(&cl_predict_selfpos);
+	Cvar_Register(&cl_predict_interp);
+	Cvar_Register(&cl_predict_interp_shift);
 	Cvar_Register(&cl_predict_lerp);
 	Cvar_Register(&cl_timeout);
 	Cvar_Register(&cl_useproxy);

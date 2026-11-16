@@ -491,7 +491,8 @@ void TP_ParsePlayerInfo(player_state_t *, player_state_t *, player_info_t *info)
 
 extern cvar_t cl_predict_players, cl_solid_players, cl_rocket2grenade;
 extern cvar_t cl_predict_half, cl_predict_lerp;
-extern cvar_t cl_predict_selfpos;
+extern cvar_t cl_predict_selfpos, cl_predict_interp, cl_predict_interp_shift;
+static void CL_SetSolidPlayersEx(int playernum, qbool include_self);
 extern cvar_t cl_model_bobbing;		
 extern cvar_t cl_nolerp, cl_lerp_monsters, cl_newlerp;
 extern cvar_t r_drawvweps;		
@@ -524,6 +525,12 @@ static struct predicted_player {
 	vec3_t lerp_offset;
 	double lerp_start_time;
 	qbool lerping;
+
+	// cl_predict_interp: the glide between received positions
+	qbool interp_valid;
+	int interp_messagenum;
+	double interp_start, interp_len;
+	vec3_t interp_from, interp_to, interp_pos;
 } predicted_players[MAX_CLIENTS];
 
 char *cl_modelnames[cl_num_modelindices];
@@ -2782,6 +2789,155 @@ static void CL_ClipPredictionLerp(struct predicted_player *player, vec3_t exact,
 	}
 }
 
+// cl_predict_interp: draw another player by gliding between the positions the server sent,
+// as MVD playback does, instead of simulating his last command. Each update starts a glide
+// from where he is drawn now to a target, lasting one update interval.
+//
+// The target is the received position moved on by his real velocity, so that he is drawn
+// where mvdsv's antilag puts him when we shoot. That is a point on his own command clock:
+//   - the update is 'age' old on that clock (more when none of his moves reached the server
+//     in time for this frame, which would otherwise show as a stop followed by a double step)
+//   - the rewind goes to the frame we acknowledged plus one server frame when the server
+//     measures our ping below 20 ms, otherwise plus 20 ms
+//   - the glide itself trails its target by half an update interval on average
+#define CL_PREDICT_INTERP_MAX_AGE 0.03f
+#define CL_PREDICT_INTERP_MAX_GAP 8 // updates; after a longer gap the glide starts over
+
+static double interp_packet_time = 1.0 / 77.0; // seconds between server updates, measured
+
+static void CL_InterpMeasurePacket(int messagenum)
+{
+	static int last_messagenum;
+	static double last_time;
+	int n = messagenum - last_messagenum;
+
+	if (n == 0) {
+		return;
+	}
+	if (n > 0 && n <= 4 && cl.time > last_time && cl.time - last_time < 0.2) {
+		interp_packet_time += 0.01 * ((cl.time - last_time) / n - interp_packet_time);
+		interp_packet_time = bound(1.0 / 250, interp_packet_time, 1.0 / 20);
+	}
+	last_messagenum = messagenum;
+	last_time = cl.time;
+}
+
+// How far ahead of the received state the player is drawn, in seconds, his age not counted.
+static float CL_InterpLead(void)
+{
+	static qbool low_ping;
+	int ping = cl.players[cl.playernum].ping;
+
+	if (cl_predict_interp_shift.value > 0) {
+		return cl_predict_interp_shift.value * 0.001f;
+	}
+	// The scoreboard ping is the server's measurement, averaged. Leave some slack around
+	// the server's 20 ms limit so a ping near it does not flip the lead back and forth.
+	if (ping < 18) {
+		low_ping = true;
+	}
+	else if (ping > 22) {
+		low_ping = false;
+	}
+	return (low_ping ? interp_packet_time : 0.02f) + 0.5f * interp_packet_time;
+}
+
+// Called with the player's collision solids installed.
+static void CL_InterpTarget(player_state_t *state, vec3_t target)
+{
+	float t = CL_InterpLead();
+	vec3_t pos, end, up, fwd;
+	trace_t tr, tu, tf, td;
+
+	VectorCopy(state->origin, target);
+	if (state->pm_type != PM_NORMAL) {
+		return;
+	}
+	if (state->messagenum == cl.parsecount) {
+		float age = cl.parsecounttime - state->state_time;
+
+		t += bound(0, age, CL_PREDICT_INTERP_MAX_AGE);
+	}
+
+	// sideways first, then up or down, so landing does not cut the sideways part short
+	VectorCopy(state->origin, pos);
+	VectorCopy(pos, end);
+	end[0] += state->velocity[0] * t;
+	end[1] += state->velocity[1] * t;
+	tr = PM_PlayerTrace(pos, end);
+	if (tr.startsolid || tr.allsolid) {
+		return;
+	}
+	if (tr.fraction < 1) {
+		// blocked: try it one step height up, as walking up stairs does
+		VectorCopy(pos, up);
+		up[2] += 18;
+		tu = PM_PlayerTrace(pos, up);
+		if (!tu.startsolid && !tu.allsolid) {
+			VectorCopy(end, fwd);
+			fwd[2] = tu.endpos[2];
+			tf = PM_PlayerTrace(tu.endpos, fwd);
+			if (!tf.startsolid && !tf.allsolid && tf.fraction > tr.fraction) {
+				VectorCopy(tf.endpos, fwd);
+				fwd[2] = pos[2];
+				td = PM_PlayerTrace(tf.endpos, fwd);
+				if (!td.startsolid && !td.allsolid) {
+					tr = td;
+				}
+			}
+		}
+	}
+	VectorCopy(tr.endpos, pos);
+	VectorCopy(pos, end);
+	end[2] += state->velocity[2] * t;
+	tr = PM_PlayerTrace(pos, end);
+	if (!tr.startsolid && !tr.allsolid) {
+		VectorCopy(tr.endpos, pos);
+	}
+	VectorCopy(pos, target);
+}
+
+static void CL_InterpRemotePlayer(int playernum, player_state_t *state, vec3_t origin)
+{
+	struct predicted_player *p = &predicted_players[playernum];
+	vec3_t d, target;
+	float f;
+
+	CL_InterpMeasurePacket(state->messagenum);
+
+	if (!p->interp_valid || state->messagenum != p->interp_messagenum) {
+		int gap = state->messagenum - p->interp_messagenum;
+
+		CL_InterpTarget(state, target);
+		p->interp_len = gap * interp_packet_time;
+		if (!p->interp_valid || gap < 0 || gap > CL_PREDICT_INTERP_MAX_GAP) {
+			VectorCopy(target, p->interp_pos);
+			p->interp_len = 0;
+		}
+		else {
+			VectorSubtract(target, p->interp_pos, d);
+			if (VectorLength(d) > CL_PREDICT_LERP_SNAP_DISTANCE) {
+				// teleported or respawned
+				VectorCopy(target, p->interp_pos);
+				p->interp_len = 0;
+			}
+		}
+		VectorCopy(p->interp_pos, p->interp_from);
+		VectorCopy(target, p->interp_to);
+		// the update arrived during the frame that just ended, so the glide starts there;
+		// starting it now would hold the model still for one frame on every update
+		p->interp_start = cl.time - cls.frametime;
+		p->interp_valid = true;
+		p->interp_messagenum = state->messagenum;
+	}
+
+	f = p->interp_len > 0 ? (cl.time - p->interp_start) / p->interp_len : 1;
+	f = bound(0, f, 1);
+	VectorSubtract(p->interp_to, p->interp_from, d);
+	VectorMA(p->interp_from, f, d, p->interp_pos);
+	VectorCopy(p->interp_pos, origin);
+}
+
 // Predict another player and, instead of jumping when a new update disagrees with the
 // last one, ease the difference out. Called with the player's collision solids installed.
 static void CL_PredictRemotePlayer(int playernum, player_state_t *state, int msec, vec3_t origin)
@@ -3027,7 +3183,19 @@ static void CL_LinkPlayers(void)
 
 		// only predict half the move to minimize overruns
 		msec = (cl_predict_half.value ? 500 : 1000) * (cl.paused ? predicted_players[j].paused_sec : (playertime - state->state_time));
-		if (!cl_predict_players.value || cls.mvdplayback) {
+		if (cl_predict_interp.integer && cl_predict_players.value && !cls.mvdplayback && !cl.paused) {
+			oldphysent = pmove.numphysent;
+			// Our own box is where we are now, not where we were at the time of his update.
+			// Clipping against it can reject a valid target and throw the glide sideways.
+			CL_SetSolidPlayersEx(j, false);
+			CL_InterpRemotePlayer(j, state, ent.origin);
+			pmove.numphysent = oldphysent;
+			VectorCopy(ent.origin, predicted_players[j].drawn_origin);
+			predicted_players[j].msec = 0;
+			predicted_players[j].drawn = true;
+			CL_ResetPredictionLerp(j);
+		}
+		else if (!cl_predict_players.value || cls.mvdplayback) {
 			VectorCopy (state->origin, ent.origin);
 			VectorCopy(ent.origin, predicted_players[j].drawn_origin);
 			predicted_players[j].msec = 0;
@@ -3038,6 +3206,7 @@ static void CL_LinkPlayers(void)
 			// A late packet still needs correction smoothing, even when
 			// there is no movement left to extrapolate.
 			msec = bound(0, msec, 255);
+			predicted_players[j].interp_valid = false;
 			oldphysent = pmove.numphysent;
 			CL_SetSolidPlayers(j);
 			CL_PredictRemotePlayer(j, state, msec, ent.origin);
@@ -3336,7 +3505,7 @@ void CL_SetUpPlayerPrediction(qbool dopred)
 // Builds all the pmove physents for the current frame.
 // Note that CL_SetUpPlayerPrediction() must be called first!
 // pmove must be setup with world and solid entity hulls before calling (via CL_PredictMove)
-void CL_SetSolidPlayers (int playernum)
+static void CL_SetSolidPlayersEx(int playernum, qbool include_self)
 {
 	int j;
 	struct predicted_player *pplayer;
@@ -3361,7 +3530,7 @@ void CL_SetSolidPlayers (int playernum)
 			continue;	// not present this frame
 
 		// the player object never gets added
-		if (j == playernum)
+		if (j == playernum || (!include_self && j == cl.playernum))
 			continue;
 
 		if (!(pplayer->flags & PF_SOLID))
@@ -3374,6 +3543,11 @@ void CL_SetSolidPlayers (int playernum)
 		pmove.numphysent++;
 		pent++;
 	}
+}
+
+void CL_SetSolidPlayers(int playernum)
+{
+	CL_SetSolidPlayersEx(playernum, true);
 }
 
 // Builds the visedicts array for cl.time

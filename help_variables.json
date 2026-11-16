@@ -2416,6 +2416,20 @@
       "group-id": "21",
       "type": "boolean"
     },
+    "cl_predict_interp": {
+      "default": "0",
+      "desc": "Draws other players by gliding between the positions the server sent, moved on by their velocity to where antilag puts them, instead of simulating their last command.",
+      "group-id": "21",
+      "type": "boolean",
+      "remarks": "Needs cl_predict_players 1. Only affects other players, not your own movement."
+    },
+    "cl_predict_interp_shift": {
+      "default": "0",
+      "desc": "How far ahead of the received position cl_predict_interp draws other players, in milliseconds.",
+      "group-id": "21",
+      "type": "float",
+      "remarks": "0 picks it from your ping, matching the server's antilag."
+    },
     "cl_predict_lerp": {
       "default": "1",
       "desc": "Smooths prediction corrections of other players over 40 ms instead of drawing them at once.",
