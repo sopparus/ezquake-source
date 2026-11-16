@@ -491,6 +491,7 @@ void TP_ParsePlayerInfo(player_state_t *, player_state_t *, player_info_t *info)
 
 extern cvar_t cl_predict_players, cl_solid_players, cl_rocket2grenade;
 extern cvar_t cl_predict_half, cl_predict_lerp;
+extern cvar_t cl_predict_selfpos;
 extern cvar_t cl_model_bobbing;		
 extern cvar_t cl_nolerp, cl_lerp_monsters, cl_newlerp;
 extern cvar_t r_drawvweps;		
@@ -3301,7 +3302,15 @@ void CL_SetUpPlayerPrediction(qbool dopred)
 		// note that the local player is special, since he moves locally we use his last predicted postition
 		if (j == cl.playernum) 
 		{
-			VectorCopy(cl.frames[cls.netchan.outgoing_sequence & UPDATE_MASK].playerstate[cl.playernum].origin, pplayer->origin);
+			// The newest predicted frame is outgoing_sequence - 1; the slot at outgoing_sequence
+			// is the oldest one in the ring (UPDATE_BACKUP packets old), so other players were
+			// clipped against where we stood most of a second ago.
+			if (cl_predict_selfpos.integer) {
+				VectorCopy(cl.simorg, pplayer->origin);
+			}
+			else {
+				VectorCopy(cl.frames[cls.netchan.outgoing_sequence & UPDATE_MASK].playerstate[cl.playernum].origin, pplayer->origin);
+			}
 		} 
 		else 
 		{

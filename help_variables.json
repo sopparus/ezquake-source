@@ -2439,6 +2439,13 @@
         }
       ]
     },
+    "cl_predict_selfpos": {
+      "default": "1",
+      "desc": "Clips other players' predicted movement against your current position instead of where you stood most of a second ago.",
+      "group-id": "21",
+      "type": "boolean",
+      "remarks": "0 restores the old behaviour."
+    },
     "cl_predict_projectiles": {
       "default": "1",
       "desc": "With weapon prediction active, spawns your own nails, grenades and rockets immediately as locally simulated projectiles, which are merged with the server's projectiles when they arrive.",
