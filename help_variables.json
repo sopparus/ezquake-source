@@ -2417,7 +2417,7 @@
       "type": "boolean"
     },
     "cl_predict_interp": {
-      "default": "0",
+      "default": "1",
       "desc": "Draws other players by gliding between the positions the server sent, moved on by their velocity to where antilag puts them, instead of simulating their last command.",
       "group-id": "21",
       "type": "boolean",

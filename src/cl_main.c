@@ -174,7 +174,7 @@ cvar_t	cl_predict_players = {"cl_predict_players", "1"};
 cvar_t	cl_solid_players = {"cl_solid_players", "1"};
 cvar_t	cl_predict_half = {"cl_predict_half", "0"};
 cvar_t	cl_predict_selfpos = {"cl_predict_selfpos", "1"};
-cvar_t	cl_predict_interp = {"cl_predict_interp", "0"};
+cvar_t	cl_predict_interp = {"cl_predict_interp", "1"};
 cvar_t	cl_predict_interp_shift = {"cl_predict_interp_shift", "0"};
 cvar_t	cl_predict_lerp = {"cl_predict_lerp", "1"};
 
