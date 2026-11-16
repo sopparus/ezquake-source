@@ -2868,8 +2868,9 @@ static void CL_InterpTarget(player_state_t *state, vec3_t target)
 	if (tr.startsolid || tr.allsolid) {
 		return;
 	}
-	if (tr.fraction < 1) {
-		// blocked: try it one step height up, as walking up stairs does
+	if (tr.fraction < 1 && state->velocity[2] == 0) {
+		// blocked on the ground: try it one step height up, as walking up stairs does.
+		// In the air this would lift him onto a ledge he is only jumping next to.
 		VectorCopy(pos, up);
 		up[2] += 18;
 		tu = PM_PlayerTrace(pos, up);
