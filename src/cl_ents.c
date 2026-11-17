@@ -2842,12 +2842,44 @@ static float CL_InterpLead(void)
 	return (low_ping ? interp_packet_time : 0.02f) + 0.5f * interp_packet_time;
 }
 
+// Moves the box from pos by move the way player movement does: whatever it runs into,
+// the rest of the move slides along that surface instead of being lost.
+static void CL_InterpSlide(vec3_t pos, const vec3_t move)
+{
+	vec3_t end, left;
+	trace_t tr;
+	int i;
+
+	VectorCopy(move, left);
+	for (i = 0; i < 3; i++) {
+		VectorAdd(pos, left, end);
+		tr = PM_PlayerTrace(pos, end);
+		if (tr.startsolid || tr.allsolid) {
+			return;
+		}
+		VectorCopy(tr.endpos, pos);
+		if (tr.fraction == 1) {
+			return;
+		}
+		VectorScale(left, 1 - tr.fraction, left);
+		VectorMA(left, -DotProduct(left, tr.plane.normal), tr.plane.normal, left);
+		if (DotProduct(left, move) <= 0) {
+			return;
+		}
+	}
+}
+
+static float CL_InterpFlatDistance2(const vec3_t a, const vec3_t b)
+{
+	return (b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]);
+}
+
 // Called with the player's collision solids installed.
 static void CL_InterpTarget(player_state_t *state, vec3_t target)
 {
 	float t = CL_InterpLead();
-	vec3_t pos, end, up, fwd;
-	trace_t tr, tu, tf, td;
+	vec3_t move, down, up, end;
+	trace_t tr;
 
 	VectorCopy(state->origin, target);
 	if (state->pm_type != PM_NORMAL) {
@@ -2858,44 +2890,41 @@ static void CL_InterpTarget(player_state_t *state, vec3_t target)
 
 		t += bound(0, age, CL_PREDICT_INTERP_MAX_AGE);
 	}
-
-	// sideways first, then up or down, so landing does not cut the sideways part short
-	VectorCopy(state->origin, pos);
-	VectorCopy(pos, end);
-	end[0] += state->velocity[0] * t;
-	end[1] += state->velocity[1] * t;
-	tr = PM_PlayerTrace(pos, end);
+	tr = PM_PlayerTrace(state->origin, state->origin);
 	if (tr.startsolid || tr.allsolid) {
 		return;
 	}
-	if (tr.fraction < 1 && state->velocity[2] == 0) {
-		// blocked on the ground: try it one step height up, as walking up stairs does.
-		// In the air this would lift him onto a ledge he is only jumping next to.
-		VectorCopy(pos, up);
-		up[2] += 18;
-		tu = PM_PlayerTrace(pos, up);
-		if (!tu.startsolid && !tu.allsolid) {
-			VectorCopy(end, fwd);
-			fwd[2] = tu.endpos[2];
-			tf = PM_PlayerTrace(tu.endpos, fwd);
-			if (!tf.startsolid && !tf.allsolid && tf.fraction > tr.fraction) {
-				VectorCopy(tf.endpos, fwd);
-				fwd[2] = pos[2];
-				td = PM_PlayerTrace(tf.endpos, fwd);
-				if (!td.startsolid && !td.allsolid) {
-					tr = td;
-				}
-			}
+
+	VectorScale(state->velocity, t, move);
+	if (state->velocity[2] != 0) {
+		// in the air: on landing the rest of the move slides along the floor
+		CL_InterpSlide(target, move);
+		return;
+	}
+
+	// on the ground: straight on, or one step height up as walking up stairs does,
+	// whichever gets further
+	VectorCopy(state->origin, down);
+	CL_InterpSlide(down, move);
+	if (CL_InterpFlatDistance2(state->origin, down) > 0.99f * DotProduct(move, move)) {
+		VectorCopy(down, target);
+		return;
+	}
+	VectorCopy(state->origin, end);
+	end[2] += 18;
+	tr = PM_PlayerTrace(state->origin, end);
+	if (!tr.startsolid && !tr.allsolid) {
+		VectorCopy(tr.endpos, up);
+		CL_InterpSlide(up, move);
+		VectorCopy(up, end);
+		end[2] = state->origin[2];
+		tr = PM_PlayerTrace(up, end);
+		if (!tr.startsolid && !tr.allsolid && tr.fraction < 1 && tr.plane.normal[2] >= 0.7f &&
+			CL_InterpFlatDistance2(state->origin, tr.endpos) > CL_InterpFlatDistance2(state->origin, down)) {
+			VectorCopy(tr.endpos, down);
 		}
 	}
-	VectorCopy(tr.endpos, pos);
-	VectorCopy(pos, end);
-	end[2] += state->velocity[2] * t;
-	tr = PM_PlayerTrace(pos, end);
-	if (!tr.startsolid && !tr.allsolid) {
-		VectorCopy(tr.endpos, pos);
-	}
-	VectorCopy(pos, target);
+	VectorCopy(down, target);
 }
 
 static void CL_InterpRemotePlayer(int playernum, player_state_t *state, vec3_t origin)
