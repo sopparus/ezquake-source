@@ -531,6 +531,9 @@ static struct predicted_player {
 	int interp_messagenum;
 	double interp_start, interp_len;
 	vec3_t interp_from, interp_to, interp_pos;
+	vec3_t interp_velocity; // in the last update, to tell braking
+	qbool interp_stepped; // the last target was one step up
+	int interp_stops; // updates in a row that said he stops before the step
 } predicted_players[MAX_CLIENTS];
 
 char *cl_modelnames[cl_num_modelindices];
@@ -2844,7 +2847,8 @@ static float CL_InterpLead(void)
 
 // Moves the box from pos by move the way player movement does: whatever it runs into,
 // the rest of the move slides along that surface instead of being lost.
-static void CL_InterpSlide(vec3_t pos, const vec3_t move)
+// If first_hit is given, it gets the first trace.
+static void CL_InterpSlide(vec3_t pos, const vec3_t move, trace_t *first_hit)
 {
 	vec3_t end, left;
 	trace_t tr;
@@ -2854,6 +2858,9 @@ static void CL_InterpSlide(vec3_t pos, const vec3_t move)
 	for (i = 0; i < 3; i++) {
 		VectorAdd(pos, left, end);
 		tr = PM_PlayerTrace(pos, end);
+		if (i == 0 && first_hit) {
+			*first_hit = tr;
+		}
 		if (tr.startsolid || tr.allsolid) {
 			return;
 		}
@@ -2874,16 +2881,59 @@ static float CL_InterpFlatDistance2(const vec3_t a, const vec3_t b)
 	return (b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]);
 }
 
-// Called with the player's collision solids installed.
-static void CL_InterpTarget(player_state_t *state, vec3_t target)
+// True if the player, braking toward the riser as hard as since the last update,
+// stops before reaching it: then he turns at the foot of the step, not on top of it.
+static qbool CL_InterpStopsBeforeStep(const struct predicted_player *p, const player_state_t *state,
+	const trace_t *riser, float t)
+{
+	int gap = state->messagenum - p->interp_messagenum;
+	float speed, previous_speed, deceleration;
+
+	if (!p->interp_valid || gap <= 0 || gap > 4 || p->interp_velocity[2] != 0 ||
+		riser->fraction >= 1 || riser->startsolid || riser->allsolid || riser->e.entnum != 0 ||
+		fabs(riser->plane.normal[2]) >= 0.1f) {
+		return false;
+	}
+	// only the speed into the riser: turning along the wall takes that away
+	// without much change in his overall speed
+	speed = -DotProduct(state->velocity, riser->plane.normal);
+	previous_speed = -DotProduct(p->interp_velocity, riser->plane.normal);
+	deceleration = (previous_speed - speed) / (gap * interp_packet_time);
+	if (speed <= 0 || deceleration <= 0) {
+		return false;
+	}
+	// stopping distance v^2 / 2a against the distance to the riser, plus one coordinate step
+	return speed * speed < 2 * deceleration * (speed * t * riser->fraction + 0.125f);
+}
+
+// Whether to aim one step up. Deciding afresh on every update would flip between
+// up and down while he brakes, so the answer holds: an update with the same velocity
+// brings no news, and once the model is on its way up it takes two stops in a row.
+static qbool CL_InterpStepAllowed(struct predicted_player *p, const player_state_t *state,
+	const trace_t *riser, float t)
+{
+	if (p->interp_valid && VectorCompare(state->velocity, p->interp_velocity)) {
+		return p->interp_stops < (p->interp_stepped ? 2 : 1);
+	}
+	if (CL_InterpStopsBeforeStep(p, state, riser, t)) {
+		p->interp_stops++;
+		return p->interp_stops < (p->interp_stepped ? 2 : 1);
+	}
+	p->interp_stops = 0;
+	return true;
+}
+
+// Called with the player's collision solids installed. Returns whether a step up was weighed.
+static qbool CL_InterpTarget(struct predicted_player *p, player_state_t *state, vec3_t target)
 {
 	float t = CL_InterpLead();
 	vec3_t move, down, up, end;
-	trace_t tr;
+	trace_t tr, riser;
+	qbool weighed = false;
 
 	VectorCopy(state->origin, target);
 	if (state->pm_type != PM_NORMAL) {
-		return;
+		return false;
 	}
 	if (state->messagenum == cl.parsecount) {
 		float age = cl.parsecounttime - state->state_time;
@@ -2892,39 +2942,48 @@ static void CL_InterpTarget(player_state_t *state, vec3_t target)
 	}
 	tr = PM_PlayerTrace(state->origin, state->origin);
 	if (tr.startsolid || tr.allsolid) {
-		return;
+		return false;
 	}
 
 	VectorScale(state->velocity, t, move);
 	if (state->velocity[2] != 0) {
 		// in the air: on landing the rest of the move slides along the floor
-		CL_InterpSlide(target, move);
-		return;
+		CL_InterpSlide(target, move, NULL);
+		return false;
 	}
 
 	// on the ground: straight on, or one step height up as walking up stairs does,
 	// whichever gets further
 	VectorCopy(state->origin, down);
-	CL_InterpSlide(down, move);
+	CL_InterpSlide(down, move, &riser);
 	if (CL_InterpFlatDistance2(state->origin, down) > 0.99f * DotProduct(move, move)) {
 		VectorCopy(down, target);
-		return;
+		return false;
 	}
 	VectorCopy(state->origin, end);
 	end[2] += 18;
 	tr = PM_PlayerTrace(state->origin, end);
 	if (!tr.startsolid && !tr.allsolid) {
 		VectorCopy(tr.endpos, up);
-		CL_InterpSlide(up, move);
+		CL_InterpSlide(up, move, NULL);
 		VectorCopy(up, end);
 		end[2] = state->origin[2];
 		tr = PM_PlayerTrace(up, end);
 		if (!tr.startsolid && !tr.allsolid && tr.fraction < 1 && tr.plane.normal[2] >= 0.7f &&
 			CL_InterpFlatDistance2(state->origin, tr.endpos) > CL_InterpFlatDistance2(state->origin, down)) {
-			VectorCopy(tr.endpos, down);
+			qbool step = true;
+
+			if (tr.endpos[2] > state->origin[2]) {
+				weighed = true;
+				step = CL_InterpStepAllowed(p, state, &riser, t);
+			}
+			if (step) {
+				VectorCopy(tr.endpos, down);
+			}
 		}
 	}
 	VectorCopy(down, target);
+	return weighed;
 }
 
 static void CL_InterpRemotePlayer(int playernum, player_state_t *state, vec3_t origin)
@@ -2938,7 +2997,11 @@ static void CL_InterpRemotePlayer(int playernum, player_state_t *state, vec3_t o
 	if (!p->interp_valid || state->messagenum != p->interp_messagenum) {
 		int gap = state->messagenum - p->interp_messagenum;
 
-		CL_InterpTarget(state, target);
+		if (!CL_InterpTarget(p, state, target)) {
+			p->interp_stops = 0;
+		}
+		p->interp_stepped = state->velocity[2] == 0 && target[2] > state->origin[2] + 1;
+		VectorCopy(state->velocity, p->interp_velocity);
 		p->interp_len = gap * interp_packet_time;
 		if (!p->interp_valid || gap < 0 || gap > CL_PREDICT_INTERP_MAX_GAP) {
 			VectorCopy(target, p->interp_pos);
